@@ -22,6 +22,8 @@ import io.opentelemetry.api.common.Attributes;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.Notification;
+import io.oxia.client.api.NotificationContinuityRegistration;
+import io.oxia.client.api.NotificationContinuitySnapshot;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.RangeScanConsumer;
 import io.oxia.client.api.options.DeleteOption;
@@ -713,6 +715,13 @@ class AsyncOxiaClientImpl implements AsyncOxiaClient {
     public void notifications(@NonNull Consumer<Notification> notificationCallback) {
         checkIfClosed();
         notificationManager.registerCallback(notificationCallback);
+    }
+
+    @Override
+    public NotificationContinuityRegistration notificationContinuity(
+            @NonNull Consumer<NotificationContinuitySnapshot> listener) {
+        checkIfClosed();
+        return notificationManager.registerContinuityListener(listener);
     }
 
     private CompletableFuture<List<String>> internalListMultiShards(

@@ -22,12 +22,13 @@ import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import io.grpc.ManagedChannel;
@@ -93,6 +94,15 @@ class NotificationManagerTest {
             when(receiverFactory.getCallback()).thenReturn(callback);
             manager =
                     new NotificationManager(executor, receiverFactory, shardManager, InstrumentProvider.NOOP);
+            lenient()
+                    .when(receiverFactory.newReceiver(anyLong(), eq(manager), any(OptionalLong.class)))
+                    .thenAnswer(
+                            invocation ->
+                                    switch ((int) invocation.<Long>getArgument(0).longValue()) {
+                                        case 1 -> receiver1;
+                                        case 2 -> receiver2;
+                                        default -> receiver3;
+                                    });
         }
 
         @AfterEach
@@ -180,16 +190,14 @@ class NotificationManagerTest {
 
             manager.registerCallback(n -> {});
 
-            var shard2offset = 1000L;
-            when(receiverFactory.newReceiver(2L, manager, OptionalLong.of(shard2offset)))
-                    .thenReturn(receiver3);
-            when(receiver2.getOffset()).thenReturn(OptionalLong.of(shard2offset));
-
             var changes =
                     new ShardAssignmentChanges(Set.of(), Set.of(), Set.of(new Shard(2L, "leader3", r)));
             manager.accept(changes);
 
+            verify(receiver1).close();
             verify(receiver2).close();
+            verify(receiverFactory, org.mockito.Mockito.times(2))
+                    .newReceiver(2L, manager, OptionalLong.empty());
         }
 
         @Test
@@ -220,11 +228,11 @@ class NotificationManagerTest {
                     .isInstanceOf(IllegalStateException.class);
 
             var changes1 =
-                    new ShardAssignmentChanges(
-                            Set.of(new Shard(1L, "leader1", r), new Shard(2L, "leader2", r)), Set.of(), Set.of());
+                    new ShardAssignmentChanges(Set.of(new Shard(3L, "leader3", r)), Set.of(), Set.of());
             manager.accept(changes1);
 
-            verifyNoMoreInteractions(receiverFactory, receiver1, receiver2);
+            verify(receiverFactory, org.mockito.Mockito.never())
+                    .newReceiver(3L, manager, OptionalLong.empty());
         }
     }
 

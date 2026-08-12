@@ -29,6 +29,8 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.when;
 
 import io.oxia.client.api.GetResult;
+import io.oxia.client.api.NotificationContinuityRegistration;
+import io.oxia.client.api.NotificationContinuitySnapshot;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.RangeScanConsumer;
 import io.oxia.client.api.Version;
@@ -57,6 +59,7 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -528,6 +531,16 @@ class AsyncOxiaClientImplTest {
         inOrder.verify(shardManager).close();
         inOrder.verify(rpcProvider).close();
         client = null;
+    }
+
+    @Test
+    void notificationContinuity() {
+        @SuppressWarnings("unchecked")
+        Consumer<NotificationContinuitySnapshot> listener = org.mockito.Mockito.mock(Consumer.class);
+        var registration = org.mockito.Mockito.mock(NotificationContinuityRegistration.class);
+        when(notificationManager.registerContinuityListener(listener)).thenReturn(registration);
+
+        assertThat(client.notificationContinuity(listener)).isSameAs(registration);
     }
 
     @Test

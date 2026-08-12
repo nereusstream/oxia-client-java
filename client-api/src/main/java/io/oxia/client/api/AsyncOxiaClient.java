@@ -226,6 +226,21 @@ public interface AsyncOxiaClient extends AutoCloseable {
     void notifications(Consumer<Notification> notificationCallback);
 
     /**
+     * Registers a listener for the process-local, store-wide notification-stream lifecycle.
+     *
+     * <p>The listener receives an immutable snapshot for the current generation and every later state
+     * transition. {@code READY} means only that every currently assigned shard has delivered its
+     * first notification batch; it is a barrier at which an application can begin its own
+     * authoritative reread. It is not a durable cursor or a permanent no-gap guarantee. Listener
+     * callbacks must not block.
+     *
+     * @param listener the non-blocking lifecycle listener
+     * @return a handle that exposes the current snapshot and deregisters the listener
+     */
+    NotificationContinuityRegistration notificationContinuity(
+            Consumer<NotificationContinuitySnapshot> listener);
+
+    /**
      * GetSequenceUpdates allows to subscribe to the updates happening on a sequential key The channel
      * will report the current latest sequence for a given key. Multiple updates can be collapsed into
      * one single event with the highest sequence.

@@ -66,8 +66,6 @@ public class ShardNotificationReceiver implements Closeable, StreamObserver<Noti
         this.callback = callback;
         this.offset = offset;
         this.log = Logger.get(ShardNotificationReceiver.class).with().attr("shard", shardId).build();
-
-        start();
     }
 
     void start() {
@@ -83,6 +81,9 @@ public class ShardNotificationReceiver implements Closeable, StreamObserver<Noti
 
     @Override
     public void onNext(NotificationBatch batch) {
+        if (!notificationManager.onBatch(this, batch)) {
+            return;
+        }
         if (offset.isPresent() && offset.getAsLong() >= batch.getOffset()) {
             // Ignore repeated notifications
             return;

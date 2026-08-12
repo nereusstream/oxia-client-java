@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -114,6 +115,7 @@ class ShardNotificationReceiverTest {
                         })
                 .when(rpcProvider)
                 .getNotifications(any(), any());
+        lenient().when(notificationManager.onBatch(any(), any())).thenReturn(true);
     }
 
     @AfterEach
@@ -140,6 +142,7 @@ class ShardNotificationReceiverTest {
                         notificationCallback,
                         notificationManager,
                         OptionalLong.empty())) {
+            notificationReceiver.start();
             await()
                     .untilAsserted(
                             () -> {
@@ -160,6 +163,7 @@ class ShardNotificationReceiverTest {
                         notificationCallback,
                         notificationManager,
                         OptionalLong.empty())) {
+            notificationReceiver.start();
             await()
                     .untilAsserted(
                             () -> {
@@ -187,6 +191,7 @@ class ShardNotificationReceiverTest {
                         notificationCallback,
                         notificationManager,
                         OptionalLong.empty())) {
+            notificationReceiver.start();
             await()
                     .untilAsserted(
                             () -> {
@@ -210,6 +215,7 @@ class ShardNotificationReceiverTest {
                         notificationCallback,
                         notificationManager,
                         OptionalLong.empty())) {
+            notificationReceiver.start();
             await()
                     .untilAsserted(
                             () -> {
