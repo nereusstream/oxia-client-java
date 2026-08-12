@@ -18,7 +18,18 @@ package io.oxia.client.it;
 import org.testcontainers.utility.DockerImageName;
 
 public final class OxiaImages {
-    public static final DockerImageName OXIA = DockerImageName.parse("oxia/oxia:0.16.3");
+    private static final String DEFAULT_IMAGE = "oxia/oxia:0.16.3";
+
+    public static final DockerImageName OXIA = configuredImage();
 
     private OxiaImages() {}
+
+    private static DockerImageName configuredImage() {
+        var configured = System.getenv("OXIA_TEST_IMAGE");
+        if (configured == null || configured.isBlank()) {
+            configured = System.getProperty("oxia.test.image", DEFAULT_IMAGE);
+        }
+        var image = DockerImageName.parse(configured);
+        return DEFAULT_IMAGE.equals(configured) ? image : image.asCompatibleSubstituteFor("oxia/oxia");
+    }
 }
