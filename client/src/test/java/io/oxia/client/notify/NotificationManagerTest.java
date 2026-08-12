@@ -47,7 +47,8 @@ import io.oxia.client.shard.HashRange;
 import io.oxia.client.shard.Shard;
 import io.oxia.client.shard.ShardAssignmentsContainer;
 import io.oxia.client.shard.ShardManager;
-import io.oxia.client.shard.ShardManager.ShardAssignmentChanges;
+import io.oxia.client.shard.ShardManager.ShardAssignmentContinuitySnapshot;
+import io.oxia.client.shard.ShardManager.ShardAssignmentContinuityState;
 import io.oxia.proto.NotificationBatch;
 import io.oxia.proto.NotificationsRequest;
 import io.oxia.proto.OxiaClientGrpc;
@@ -95,6 +96,9 @@ class NotificationManagerTest {
             manager =
                     new NotificationManager(executor, receiverFactory, shardManager, InstrumentProvider.NOOP);
             lenient()
+                    .when(shardManager.assignmentContinuity())
+                    .thenReturn(continuity(1, ShardAssignmentContinuityState.READY, Set.of()));
+            lenient()
                     .when(receiverFactory.newReceiver(anyLong(), eq(manager), any(OptionalLong.class)))
                     .thenAnswer(
                             invocation ->
@@ -112,11 +116,14 @@ class NotificationManagerTest {
 
         @Test
         void startOnRegisterCallback() {
-            when(shardManager.allShards())
+            when(shardManager.assignmentContinuity())
                     .thenReturn(
-                            Set.of(
-                                    new Shard(1L, "leader1", new HashRange(1, 2)),
-                                    new Shard(2L, "leader2", new HashRange(2, 3))));
+                            continuity(
+                                    1,
+                                    ShardAssignmentContinuityState.READY,
+                                    Set.of(
+                                            new Shard(1L, "leader1", new HashRange(1, 2)),
+                                            new Shard(2L, "leader2", new HashRange(2, 3)))));
             lenient().when(shardManager.leader(1L)).thenReturn("leader1");
             lenient().when(shardManager.leader(2L)).thenReturn("leader2");
 
@@ -128,10 +135,11 @@ class NotificationManagerTest {
 
         @Test
         void acceptNotStarted() {
-            var changes =
-                    new ShardAssignmentChanges(
-                            Set.of(new Shard(1L, "leader1", r), new Shard(2L, "leader2", r)), Set.of(), Set.of());
-            manager.accept(changes);
+            manager.onContinuityChange(
+                    continuity(
+                            1,
+                            ShardAssignmentContinuityState.READY,
+                            Set.of(new Shard(1L, "leader1", r), new Shard(2L, "leader2", r))));
 
             verifyNoInteractions(receiver1, receiver2, receiver3);
         }
@@ -140,16 +148,19 @@ class NotificationManagerTest {
         void acceptRemoveShard() {
             when(receiverFactory.newReceiver(1L, manager, OptionalLong.empty())).thenReturn(receiver1);
             when(receiverFactory.newReceiver(2L, manager, OptionalLong.empty())).thenReturn(receiver2);
-            when(shardManager.allShards())
-                    .thenReturn(Set.of(new Shard(1L, "leader1", r), new Shard(2L, "leader2", r)));
+            when(shardManager.assignmentContinuity())
+                    .thenReturn(
+                            continuity(
+                                    1,
+                                    ShardAssignmentContinuityState.READY,
+                                    Set.of(new Shard(1L, "leader1", r), new Shard(2L, "leader2", r))));
             lenient().when(shardManager.leader(1L)).thenReturn("leader1");
             lenient().when(shardManager.leader(2L)).thenReturn("leader2");
 
             manager.registerCallback(n -> {});
 
-            var changes =
-                    new ShardAssignmentChanges(Set.of(), Set.of(new Shard(2L, "leader2", r)), Set.of());
-            manager.accept(changes);
+            manager.onContinuityChange(
+                    continuity(1, ShardAssignmentContinuityState.READY, Set.of(new Shard(1L, "leader1", r))));
 
             verify(receiver2).close();
         }
@@ -162,7 +173,12 @@ class NotificationManagerTest {
             lenient()
                     .when(receiverFactory.newReceiver(2L, manager, OptionalLong.empty()))
                     .thenReturn(receiver2);
-            lenient().when(shardManager.allShardIds()).thenReturn(Set.of(1L, 2L));
+            when(shardManager.assignmentContinuity())
+                    .thenReturn(
+                            continuity(
+                                    1,
+                                    ShardAssignmentContinuityState.READY,
+                                    Set.of(new Shard(1L, "leader1", r), new Shard(2L, "leader2", r))));
             lenient().when(shardManager.leader(1L)).thenReturn("leader1");
             lenient().when(shardManager.leader(2L)).thenReturn("leader2");
 
@@ -170,9 +186,14 @@ class NotificationManagerTest {
 
             when(receiverFactory.newReceiver(3L, manager, OptionalLong.empty())).thenReturn(receiver3);
 
-            var changes =
-                    new ShardAssignmentChanges(Set.of(new Shard(3L, "leader3", r)), Set.of(), Set.of());
-            manager.accept(changes);
+            manager.onContinuityChange(
+                    continuity(
+                            1,
+                            ShardAssignmentContinuityState.READY,
+                            Set.of(
+                                    new Shard(1L, "leader1", r),
+                                    new Shard(2L, "leader2", r),
+                                    new Shard(3L, "leader3", r))));
         }
 
         @Test
@@ -180,19 +201,24 @@ class NotificationManagerTest {
             lenient()
                     .when(receiverFactory.newReceiver(2, manager, OptionalLong.empty()))
                     .thenReturn(receiver2);
-            when(shardManager.allShards())
+            when(shardManager.assignmentContinuity())
                     .thenReturn(
-                            Set.of(
-                                    new Shard(1, "leader1", new HashRange(1, 2)),
-                                    new Shard(2, "leader2", new HashRange(2, 3))));
+                            continuity(
+                                    1,
+                                    ShardAssignmentContinuityState.READY,
+                                    Set.of(
+                                            new Shard(1, "leader1", new HashRange(1, 2)),
+                                            new Shard(2, "leader2", new HashRange(2, 3)))));
             lenient().when(shardManager.leader(1L)).thenReturn("leader1");
             lenient().when(shardManager.leader(2L)).thenReturn("leader2");
 
             manager.registerCallback(n -> {});
 
-            var changes =
-                    new ShardAssignmentChanges(Set.of(), Set.of(), Set.of(new Shard(2L, "leader3", r)));
-            manager.accept(changes);
+            manager.onContinuityChange(
+                    continuity(
+                            1,
+                            ShardAssignmentContinuityState.READY,
+                            Set.of(new Shard(1, "leader1", new HashRange(1, 2)), new Shard(2L, "leader3", r))));
 
             verify(receiver1).close();
             verify(receiver2).close();
@@ -209,11 +235,14 @@ class NotificationManagerTest {
         void close() throws Exception {
             when(receiverFactory.newReceiver(1L, manager, OptionalLong.empty())).thenReturn(receiver1);
             when(receiverFactory.newReceiver(2L, manager, OptionalLong.empty())).thenReturn(receiver2);
-            when(shardManager.allShards())
+            when(shardManager.assignmentContinuity())
                     .thenReturn(
-                            Set.of(
-                                    new Shard(1, "leader1", new HashRange(1, 2)),
-                                    new Shard(2, "leader2", new HashRange(2, 3))));
+                            continuity(
+                                    1,
+                                    ShardAssignmentContinuityState.READY,
+                                    Set.of(
+                                            new Shard(1, "leader1", new HashRange(1, 2)),
+                                            new Shard(2, "leader2", new HashRange(2, 3)))));
             lenient().when(shardManager.leader(1L)).thenReturn("leader1");
             lenient().when(shardManager.leader(2L)).thenReturn("leader2");
 
@@ -227,9 +256,8 @@ class NotificationManagerTest {
             assertThatThrownBy(() -> manager.registerCallback(callback))
                     .isInstanceOf(IllegalStateException.class);
 
-            var changes1 =
-                    new ShardAssignmentChanges(Set.of(new Shard(3L, "leader3", r)), Set.of(), Set.of());
-            manager.accept(changes1);
+            manager.onContinuityChange(
+                    continuity(2, ShardAssignmentContinuityState.READY, Set.of(new Shard(3L, "leader3", r))));
 
             verify(receiverFactory, org.mockito.Mockito.never())
                     .newReceiver(3L, manager, OptionalLong.empty());
@@ -303,7 +331,8 @@ class NotificationManagerTest {
             channel2 = InProcessChannelBuilder.forName(serverName2).directExecutor().build();
             stub1 = OxiaClientGrpc.newStub(channel1);
             stub2 = OxiaClientGrpc.newStub(channel2);
-            doAnswer(
+            lenient()
+                    .doAnswer(
                             invocation -> {
                                 NotificationsRequest request = invocation.getArgument(0);
                                 if (request.getShard() == shardId1) {
@@ -332,15 +361,10 @@ class NotificationManagerTest {
 
             @Cleanup("shutdownNow")
             var executor = Executors.newSingleThreadScheduledExecutor();
+            when(shardManager.assignmentContinuity())
+                    .thenReturn(continuity(1, ShardAssignmentContinuityState.ARMING, Set.of()));
             try (var manager =
                     new NotificationManager(executor, rpcProvider, shardManager, InstrumentProvider.NOOP)) {
-                manager.registerCallback(notificationCallback);
-                var changes =
-                        new ShardAssignmentChanges(
-                                Set.of(new Shard(1L, "leader1", r), new Shard(2L, "leader2", r)),
-                                Set.of(),
-                                Set.of());
-                manager.accept(changes);
                 doAnswer(
                                 invocation -> {
                                     NotificationsRequest request = invocation.getArgument(0);
@@ -353,6 +377,12 @@ class NotificationManagerTest {
                                 })
                         .when(rpcProvider)
                         .getNotifications(any(), any());
+                manager.registerCallback(notificationCallback);
+                manager.onContinuityChange(
+                        continuity(
+                                1,
+                                ShardAssignmentContinuityState.READY,
+                                Set.of(new Shard(1L, "leader1", r), new Shard(2L, "leader2", r))));
                 await()
                         .untilAsserted(
                                 () -> {
@@ -388,5 +418,10 @@ class NotificationManagerTest {
             notification.setType(KEY_MODIFIED).setVersionId(version);
             return notification;
         }
+    }
+
+    private static ShardAssignmentContinuitySnapshot continuity(
+            long generation, ShardAssignmentContinuityState state, Set<Shard> assignment) {
+        return new ShardAssignmentContinuitySnapshot(generation, state, assignment);
     }
 }

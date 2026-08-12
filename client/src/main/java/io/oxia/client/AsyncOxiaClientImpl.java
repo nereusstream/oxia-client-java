@@ -91,7 +91,7 @@ class AsyncOxiaClientImpl implements AsyncOxiaClient {
         shardManagerRef.set(shardManager);
         var notificationManager =
                 new NotificationManager(asyncExecutor, rpcProvider, shardManager, instrumentProvider);
-        shardManager.addCallback(notificationManager);
+        shardManager.addContinuityListener(notificationManager);
         var readBatcherPool = new BatcherPool("oxia-read-batcher", config.batchingThreads());
         var readBatchManager =
                 BatchManager.newReadBatchManager(
@@ -141,7 +141,7 @@ class AsyncOxiaClientImpl implements AsyncOxiaClient {
                             var notificationManager =
                                     new NotificationManager(
                                             asyncExecutor, rpcProvider, shardManager, instrumentProvider);
-                            shardManager.addCallback(notificationManager);
+                            shardManager.addContinuityListener(notificationManager);
                             var readBatchManager =
                                     BatchManager.newReadBatchManager(
                                             config,
@@ -959,7 +959,7 @@ class AsyncOxiaClientImpl implements AsyncOxiaClient {
         if (!ownsResources) {
             // Detach from the shared shard-assignment stream so it stops dispatching to this client.
             shardManager.removeCallback(sessionManager);
-            shardManager.removeCallback(notificationManager);
+            shardManager.removeContinuityListener(notificationManager);
         }
         readBatchManager.close();
         writeBatchManager.close();

@@ -40,6 +40,7 @@ import io.oxia.proto.ShardAssignments;
 import io.oxia.proto.ShardAssignmentsRequest;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -56,11 +57,14 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
     private final RpcProvider rpcProvider;
     private final ShardAssignmentsContainer assignments;
     private final CompositeConsumer<ShardAssignmentChanges> callbacks;
+    private final Set<ShardAssignmentContinuityListener> continuityListeners;
 
     private final Backoff backoff = new Backoff();
     private final CompletableFuture<Void> initialAssignmentsFuture;
 
     private volatile boolean closed;
+    private long continuityGeneration;
+    private ShardAssignmentContinuitySnapshot continuitySnapshot;
 
     private final Counter shardAssignmentsEvents;
 
@@ -73,7 +77,12 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
         this.asyncExecutor = asyncExecutor;
         this.assignments = new ShardAssignmentsContainer(Xxh332HashRangeShardStrategy, namespace);
         this.callbacks = new CompositeConsumer<>();
+        this.continuityListeners = new HashSet<>();
         this.initialAssignmentsFuture = new CompletableFuture<>();
+        this.continuityGeneration = 1;
+        this.continuitySnapshot =
+                new ShardAssignmentContinuitySnapshot(
+                        continuityGeneration, ShardAssignmentContinuityState.ARMING, Set.of());
         this.log =
                 Logger.get(ShardManager.class).with().attr("namespace", assignments.getNamespace()).build();
 
@@ -87,7 +96,13 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
 
     @Override
     public void close() {
-        closed = true;
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+        }
+        publishContinuity(ShardAssignmentContinuityState.CLOSED, allShardsSnapshot(), true);
     }
 
     public CompletableFuture<Void> start() {
@@ -100,6 +115,9 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
 
     @Override
     public void onNext(ShardAssignments assignments) {
+        if (closed) {
+            return;
+        }
         shardAssignmentsEvents.increment();
         updateAssignments(assignments);
         backoff.reset();
@@ -123,6 +141,7 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
                 return;
             }
         }
+        publishContinuity(ShardAssignmentContinuityState.ARMING, allShardsSnapshot(), true);
         log.warn().exceptionMessage(getRootCause(error)).log("Failed receiving shard assignments");
         asyncExecutor.schedule(
                 () -> {
@@ -141,6 +160,7 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
             return;
         }
 
+        publishContinuity(ShardAssignmentContinuityState.ARMING, allShardsSnapshot(), true);
         log.warn("Stream closed while receiving shard assignments");
         asyncExecutor.schedule(
                 () -> {
@@ -174,6 +194,7 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
         var updatedMap = recomputeShardHashBoundaries(assignments.allShards(), updates);
         var changes = computeShardLeaderChanges(assignments.allShards(), updatedMap);
         assignments.update(changes);
+        publishContinuity(ShardAssignmentContinuityState.READY, allShardsSnapshot(), false);
         callbacks.accept(changes);
     }
 
@@ -252,5 +273,78 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
 
     public void removeCallback(@NonNull Consumer<ShardAssignmentChanges> callback) {
         callbacks.remove(callback);
+    }
+
+    public synchronized void addContinuityListener(
+            @NonNull ShardAssignmentContinuityListener listener) {
+        continuityListeners.add(listener);
+        publishContinuityListener(listener, continuitySnapshot);
+    }
+
+    public synchronized void removeContinuityListener(
+            @NonNull ShardAssignmentContinuityListener listener) {
+        continuityListeners.remove(listener);
+    }
+
+    public synchronized ShardAssignmentContinuitySnapshot assignmentContinuity() {
+        return continuitySnapshot;
+    }
+
+    private Set<Shard> allShardsSnapshot() {
+        return Set.copyOf(assignments.allShards().values());
+    }
+
+    private void publishContinuity(
+            ShardAssignmentContinuityState state, Set<Shard> assignment, boolean advanceGeneration) {
+        final Set<ShardAssignmentContinuityListener> listeners;
+        final ShardAssignmentContinuitySnapshot snapshot;
+        synchronized (this) {
+            if (closed && state != ShardAssignmentContinuityState.CLOSED) {
+                return;
+            }
+            if (advanceGeneration) {
+                if (continuityGeneration == Long.MAX_VALUE) {
+                    throw new IllegalStateException("shard assignment continuity generation overflow");
+                }
+                continuityGeneration += 1;
+            }
+            snapshot =
+                    new ShardAssignmentContinuitySnapshot(
+                            continuityGeneration, state, Set.copyOf(assignment));
+            continuitySnapshot = snapshot;
+            listeners = Set.copyOf(continuityListeners);
+        }
+        listeners.forEach(listener -> publishContinuityListener(listener, snapshot));
+    }
+
+    private void publishContinuityListener(
+            ShardAssignmentContinuityListener listener, ShardAssignmentContinuitySnapshot snapshot) {
+        try {
+            listener.onContinuityChange(snapshot);
+        } catch (Throwable error) {
+            log.warn().exceptionMessage(error).log("Shard assignment continuity listener failed");
+        }
+    }
+
+    public enum ShardAssignmentContinuityState {
+        ARMING,
+        READY,
+        CLOSED
+    }
+
+    public record ShardAssignmentContinuitySnapshot(
+            long generation, ShardAssignmentContinuityState state, Set<Shard> assignment) {
+        public ShardAssignmentContinuitySnapshot {
+            if (generation <= 0) {
+                throw new IllegalArgumentException("generation must be positive");
+            }
+            state = java.util.Objects.requireNonNull(state, "state");
+            assignment = Set.copyOf(assignment);
+        }
+    }
+
+    @FunctionalInterface
+    public interface ShardAssignmentContinuityListener {
+        void onContinuityChange(ShardAssignmentContinuitySnapshot snapshot);
     }
 }

@@ -34,8 +34,10 @@ import io.oxia.proto.ShardAssignments;
 import io.oxia.proto.ShardAssignmentsRequest;
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -178,6 +180,9 @@ public class ShardManagerTest {
             var stubCalls = new AtomicInteger();
             manager =
                     new ShardManager(asyncExecutor, rpcProvider, InstrumentProvider.NOOP, DefaultNamespace);
+            List<ShardManager.ShardAssignmentContinuitySnapshot> continuity =
+                    new CopyOnWriteArrayList<>();
+            manager.addContinuityListener(continuity::add);
 
             var assignment = new ShardAssignment();
             assignment.setShard(0).setLeader("leader0");
@@ -202,6 +207,77 @@ public class ShardManagerTest {
             verify(rpcProvider, org.mockito.Mockito.times(2))
                     .getShardAssignments(any(ShardAssignmentsRequest.class), eq(manager));
             assertThat(stubCalls).hasValue(2);
+            assertThat(continuity)
+                    .extracting(
+                            ShardManager.ShardAssignmentContinuitySnapshot::generation,
+                            ShardManager.ShardAssignmentContinuitySnapshot::state)
+                    .containsExactly(
+                            org.assertj.core.groups.Tuple.tuple(
+                                    1L, ShardManager.ShardAssignmentContinuityState.ARMING),
+                            org.assertj.core.groups.Tuple.tuple(
+                                    2L, ShardManager.ShardAssignmentContinuityState.ARMING),
+                            org.assertj.core.groups.Tuple.tuple(
+                                    2L, ShardManager.ShardAssignmentContinuityState.READY));
+        }
+
+        @Test
+        void reconnectWithSameAssignmentPublishesFreshFullReadySnapshot() {
+            var assignment = new ShardAssignment();
+            assignment.setShard(0).setLeader("leader0");
+            assignment.setInt32HashRange().setMinHashInclusive(0).setMaxHashInclusive(Integer.MAX_VALUE);
+            var assignments = new ShardAssignments();
+            assignments.putNamespaces(namespace).addAssignment().copyFrom(assignment);
+            List<ShardManager.ShardAssignmentContinuitySnapshot> continuity =
+                    new CopyOnWriteArrayList<>();
+            manager.addContinuityListener(continuity::add);
+
+            manager.onNext(assignments);
+            manager.onCompleted();
+            manager.onNext(assignments);
+
+            assertThat(continuity)
+                    .extracting(
+                            ShardManager.ShardAssignmentContinuitySnapshot::generation,
+                            ShardManager.ShardAssignmentContinuitySnapshot::state)
+                    .containsExactly(
+                            org.assertj.core.groups.Tuple.tuple(
+                                    1L, ShardManager.ShardAssignmentContinuityState.ARMING),
+                            org.assertj.core.groups.Tuple.tuple(
+                                    1L, ShardManager.ShardAssignmentContinuityState.READY),
+                            org.assertj.core.groups.Tuple.tuple(
+                                    2L, ShardManager.ShardAssignmentContinuityState.ARMING),
+                            org.assertj.core.groups.Tuple.tuple(
+                                    2L, ShardManager.ShardAssignmentContinuityState.READY));
+            assertThat(continuity.get(3).assignment())
+                    .containsExactly(new Shard(0L, "leader0", new HashRange(0, Integer.MAX_VALUE)));
+        }
+
+        @Test
+        void closePublishesOneTerminalSnapshotAndIgnoresLateAssignment() {
+            List<ShardManager.ShardAssignmentContinuitySnapshot> continuity =
+                    new CopyOnWriteArrayList<>();
+            manager.addContinuityListener(continuity::add);
+            var assignment = new ShardAssignment();
+            assignment.setShard(0).setLeader("leader0");
+            assignment.setInt32HashRange().setMinHashInclusive(0).setMaxHashInclusive(Integer.MAX_VALUE);
+            var assignments = new ShardAssignments();
+            assignments.putNamespaces(namespace).addAssignment().copyFrom(assignment);
+
+            manager.close();
+            manager.close();
+            manager.onNext(assignments);
+
+            assertThat(continuity)
+                    .extracting(
+                            ShardManager.ShardAssignmentContinuitySnapshot::generation,
+                            ShardManager.ShardAssignmentContinuitySnapshot::state)
+                    .containsExactly(
+                            org.assertj.core.groups.Tuple.tuple(
+                                    1L, ShardManager.ShardAssignmentContinuityState.ARMING),
+                            org.assertj.core.groups.Tuple.tuple(
+                                    2L, ShardManager.ShardAssignmentContinuityState.CLOSED));
+            assertThat(manager.assignmentContinuity().state())
+                    .isEqualTo(ShardManager.ShardAssignmentContinuityState.CLOSED);
         }
 
         @Test

@@ -19,24 +19,23 @@ import static io.oxia.client.api.Notification.KeyModified;
 import static lombok.AccessLevel.PACKAGE;
 
 import io.github.merlimat.slog.Logger;
-import io.grpc.stub.StreamObserver;
 import io.oxia.client.CompositeConsumer;
 import io.oxia.client.api.Notification;
 import io.oxia.client.api.Notification.KeyCreated;
 import io.oxia.client.api.Notification.KeyDeleted;
 import io.oxia.client.grpc.RpcProvider;
-import io.oxia.client.util.Backoff;
+import io.oxia.client.grpc.observer.CancelableStreamObserver;
 import io.oxia.proto.NotificationBatch;
 import io.oxia.proto.NotificationsRequest;
 import java.io.Closeable;
 import java.util.OptionalLong;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import lombok.Getter;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 
-public class ShardNotificationReceiver implements Closeable, StreamObserver<NotificationBatch> {
+public class ShardNotificationReceiver extends CancelableStreamObserver<NotificationBatch>
+        implements Closeable {
 
     private final Logger log;
 
@@ -51,8 +50,6 @@ public class ShardNotificationReceiver implements Closeable, StreamObserver<Noti
     @Getter private volatile @NonNull OptionalLong offset;
 
     private volatile boolean closed = false;
-
-    private final Backoff backoff = new Backoff();
 
     ShardNotificationReceiver(
             @NonNull RpcProvider rpcProvider,
@@ -69,6 +66,9 @@ public class ShardNotificationReceiver implements Closeable, StreamObserver<Noti
     }
 
     void start() {
+        if (closed) {
+            return;
+        }
         var request = new NotificationsRequest();
         request.setShard(shardId);
         offset.ifPresent(request::setStartOffsetExclusive);
@@ -80,7 +80,7 @@ public class ShardNotificationReceiver implements Closeable, StreamObserver<Noti
     }
 
     @Override
-    public void onNext(NotificationBatch batch) {
+    protected void handleNext(NotificationBatch batch) {
         if (!notificationManager.onBatch(this, batch)) {
             return;
         }
@@ -115,33 +115,17 @@ public class ShardNotificationReceiver implements Closeable, StreamObserver<Noti
     }
 
     @Override
-    public void onError(Throwable t) {
+    protected void handleError(Throwable t) {
         if (closed) {
             return;
         }
-
-        long retryDelayMillis = backoff.nextDelayMillis();
-        log.warn()
-                .attr("retryInSeconds", retryDelayMillis / 1000.0)
-                .exceptionMessage(t)
-                .log("Error while receiving notifications");
-        notificationManager
-                .getExecutor()
-                .schedule(
-                        () -> {
-                            if (!closed) {
-                                log.info("Retrying getting notifications");
-                                start();
-                            }
-                        },
-                        retryDelayMillis,
-                        TimeUnit.MILLISECONDS);
+        notificationManager.onReceiverError(this, t);
     }
 
     @Override
-    public void onCompleted() {
+    protected void handleComplete() {
         if (!closed) {
-            start();
+            notificationManager.onReceiverCompleted(this);
         }
     }
 
@@ -165,5 +149,6 @@ public class ShardNotificationReceiver implements Closeable, StreamObserver<Noti
     @Override
     public void close() {
         this.closed = true;
+        cancel();
     }
 }

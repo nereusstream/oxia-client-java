@@ -27,6 +27,7 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.Status;
 import io.grpc.protobuf.StatusProto;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import io.oxia.client.OxiaClientBuilderImpl;
 import io.oxia.client.api.OxiaClientBuilder;
@@ -50,6 +51,7 @@ import io.oxia.proto.ReadResponse;
 import io.oxia.proto.SessionHeartbeat;
 import io.oxia.proto.WriteResponse;
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -215,7 +217,7 @@ class GrpcRpcProviderTest {
     }
 
     @Test
-    void getNotificationsRetriesWithLeaderHint() throws Exception {
+    void getNotificationsReportsFirstAttemptFailureWithoutOpaqueRetry() throws Exception {
         var leaderServerRequests = new AtomicReference<NotificationsRequest>();
         var leaderService =
                 new OxiaClientGrpc.OxiaClientImplBase() {
@@ -254,34 +256,70 @@ class GrpcRpcProviderTest {
             var request = new NotificationsRequest();
             request.setShard(1);
             var notification = new AtomicReference<NotificationBatch>();
+            var error = new AtomicReference<Throwable>();
 
             provider.getNotifications(
                     request,
-                    new StreamObserver<>() {
+                    new CancelableStreamObserver<>() {
                         @Override
-                        public void onNext(NotificationBatch value) {
+                        protected void handleNext(NotificationBatch value) {
                             notification.set(value);
                         }
 
                         @Override
-                        public void onError(Throwable t) {}
+                        protected void handleError(Throwable throwable) {
+                            error.set(throwable);
+                        }
 
                         @Override
-                        public void onCompleted() {}
+                        protected void handleComplete() {}
                     });
 
             await()
                     .untilAsserted(
                             () -> {
-                                assertThat(notification.get()).isNotNull();
-                                assertThat(notification.get().getOffset()).isEqualTo(1);
+                                assertThat(error.get()).isNotNull();
+                                assertThat(notification.get()).isNull();
                                 assertThat(firstServerRequests.get()).isNotNull();
-                                assertThat(leaderServerRequests.get()).isNotNull();
+                                assertThat(leaderServerRequests.get()).isNull();
                             });
         } finally {
             executor.shutdownNow();
             staleLeaderServer.shutdownNow();
             leaderServer.shutdownNow();
+        }
+    }
+
+    @Test
+    void cancelingNotificationObserverCancelsActualGrpcCall() throws Exception {
+        var requestStarted = new CountDownLatch(1);
+        var requestCanceled = new CountDownLatch(1);
+        var service =
+                new OxiaClientGrpc.OxiaClientImplBase() {
+                    @Override
+                    public void getNotifications(
+                            NotificationsRequest request, StreamObserver<NotificationBatch> responseObserver) {
+                        ((ServerCallStreamObserver<NotificationBatch>) responseObserver)
+                                .setOnCancelHandler(requestCanceled::countDown);
+                        requestStarted.countDown();
+                    }
+                };
+        Server server = ServerBuilder.forPort(0).directExecutor().addService(service).build().start();
+        var address = "localhost:" + server.getPort();
+        var executor = Executors.newSingleThreadScheduledExecutor();
+        var config = ((OxiaClientBuilderImpl) OxiaClientBuilder.create(address)).getClientConfig();
+        var observer = capturingCancelableObserver(new AtomicReference<NotificationBatch>());
+
+        try (var provider = new GrpcRpcProvider(config, executor, shardId -> address)) {
+            provider.getNotifications(new NotificationsRequest().setShard(1), observer);
+            assertThat(requestStarted.await(5, TimeUnit.SECONDS)).isTrue();
+
+            observer.cancel();
+
+            assertThat(requestCanceled.await(5, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            executor.shutdownNow();
+            server.shutdownNow();
         }
     }
 

@@ -60,4 +60,10 @@ public final class ManagedObservers {
                     @NonNull CompletableFuture<Void> barrierFuture) {
         return new BarrierClientResponseObserver<>(streamObserver, barrierFuture);
     }
+
+    public static <ReqT, RespT>
+            CancelableClientResponseObserver<ReqT, RespT> toCancelableClientResponseObserver(
+                    @NonNull CancelableStreamObserver<RespT> streamObserver) {
+        return new CancelableClientResponseObserver<>(streamObserver);
+    }
 }

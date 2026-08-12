@@ -16,6 +16,7 @@
 package io.oxia.client.notify;
 
 import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -26,14 +27,29 @@ final class SerialContinuityDispatcher {
     private final Executor executor;
     private final Queue<Runnable> tasks = new ConcurrentLinkedQueue<>();
     private final AtomicBoolean draining = new AtomicBoolean();
+    private volatile Thread dispatchThread;
 
     SerialContinuityDispatcher(@NonNull Executor executor) {
         this.executor = executor;
     }
 
-    void execute(@NonNull Runnable task) {
-        tasks.add(task);
+    CompletableFuture<Void> execute(@NonNull Runnable task) {
+        var completion = new CompletableFuture<Void>();
+        tasks.add(
+                () -> {
+                    try {
+                        task.run();
+                        completion.complete(null);
+                    } catch (Throwable error) {
+                        completion.completeExceptionally(error);
+                    }
+                });
         scheduleDrain();
+        return completion;
+    }
+
+    boolean isDispatchThread() {
+        return Thread.currentThread() == dispatchThread;
     }
 
     private void scheduleDrain() {
@@ -43,12 +59,14 @@ final class SerialContinuityDispatcher {
     }
 
     private void drain() {
+        dispatchThread = Thread.currentThread();
         try {
             Runnable task;
             while ((task = tasks.poll()) != null) {
                 task.run();
             }
         } finally {
+            dispatchThread = null;
             draining.set(false);
             if (!tasks.isEmpty()) {
                 scheduleDrain();

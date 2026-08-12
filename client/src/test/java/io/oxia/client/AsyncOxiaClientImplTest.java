@@ -26,6 +26,8 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.oxia.client.api.GetResult;
@@ -530,6 +532,33 @@ class AsyncOxiaClientImplTest {
         inOrder.verify(notificationManager).close();
         inOrder.verify(shardManager).close();
         inOrder.verify(rpcProvider).close();
+        client = null;
+    }
+
+    @Test
+    void sharedClientCloseDetachesContinuityWithoutClosingSharedShardManager() throws Exception {
+        client.close();
+        client =
+                new AsyncOxiaClientImpl(
+                        "shared-client-identity",
+                        Executors.newSingleThreadScheduledExecutor(),
+                        InstrumentProvider.NOOP,
+                        rpcProvider,
+                        shardManager,
+                        notificationManager,
+                        readBatchManager,
+                        writeBatchManager,
+                        sessionManager,
+                        requestTimeout,
+                        maxPendingBytes,
+                        false);
+
+        client.close();
+
+        verify(shardManager).removeContinuityListener(notificationManager);
+        verify(notificationManager, org.mockito.Mockito.times(2)).close();
+        verify(shardManager).close();
+        verify(shardManager, never()).addContinuityListener(notificationManager);
         client = null;
     }
 

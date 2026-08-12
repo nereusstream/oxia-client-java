@@ -21,6 +21,7 @@ import static io.oxia.proto.NotificationType.KEY_MODIFIED;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -46,11 +47,8 @@ import io.oxia.proto.OxiaClientGrpc;
 import java.util.OptionalLong;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
-import lombok.Cleanup;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -173,17 +171,10 @@ class ShardNotificationReceiverTest {
     }
 
     @Test
-    public void recoveryFromError() {
-        @Cleanup("shutdownNow")
-        ScheduledExecutorService executorService = Executors.newSingleThreadScheduledExecutor();
-        when(notificationManager.getExecutor()).thenReturn(executorService);
-        when(notificationManager.getCounterNotificationsReceived()).thenReturn(mock(Counter.class));
-        when(notificationManager.getCounterNotificationsBatchesReceived())
-                .thenReturn(mock(Counter.class));
-
-        responses.offer(new NotificationWrapper(null, Status.UNAVAILABLE.asException(), false));
+    void staleFirstBatchIsDroppedWithoutPayloadDelivery() throws Exception {
+        when(notificationManager.onBatch(any(), any())).thenReturn(false);
         var notifications = newNotificationBatch("key1", created(1L));
-        responses.offer(new NotificationWrapper(notifications, null, false));
+        responses.put(new NotificationWrapper(notifications, null, false));
         try (var notificationReceiver =
                 new ShardNotificationReceiver(
                         rpcProvider,
@@ -194,15 +185,33 @@ class ShardNotificationReceiverTest {
             notificationReceiver.start();
             await()
                     .untilAsserted(
-                            () -> {
-                                verify(notificationCallback).accept(new KeyCreated("key1", 1L));
-                            });
+                            () -> verify(notificationManager).onBatch(notificationReceiver, notifications));
+            verify(notificationCallback, never()).accept(any());
+            verify(notificationManager, never()).getCounterNotificationsReceived();
+            verify(notificationManager, never()).getCounterNotificationsBatchesReceived();
         }
-        assertThat(requests).hasValue(2);
     }
 
     @Test
-    public void recoveryFromEndOfStream() throws Exception {
+    public void reportsErrorToManagerWithoutReceiverLocalRetry() {
+        responses.offer(new NotificationWrapper(null, Status.UNAVAILABLE.asException(), false));
+        try (var notificationReceiver =
+                new ShardNotificationReceiver(
+                        rpcProvider,
+                        shardId,
+                        notificationCallback,
+                        notificationManager,
+                        OptionalLong.empty())) {
+            notificationReceiver.start();
+            await()
+                    .untilAsserted(
+                            () -> verify(notificationManager).onReceiverError(eq(notificationReceiver), any()));
+        }
+        assertThat(requests).hasValue(1);
+    }
+
+    @Test
+    public void reportsEndOfStreamToManagerWithoutReceiverLocalRetry() throws Exception {
         when(notificationManager.getCounterNotificationsReceived()).thenReturn(mock(Counter.class));
         when(notificationManager.getCounterNotificationsBatchesReceived())
                 .thenReturn(mock(Counter.class));
@@ -220,9 +229,10 @@ class ShardNotificationReceiverTest {
                     .untilAsserted(
                             () -> {
                                 verify(notificationCallback).accept(new KeyCreated("key1", 1L));
+                                verify(notificationManager).onReceiverCompleted(notificationReceiver);
                             });
         }
-        assertThat(requests).hasValue(2);
+        assertThat(requests).hasValue(1);
     }
 
     static NotificationBatch newNotificationBatch(
