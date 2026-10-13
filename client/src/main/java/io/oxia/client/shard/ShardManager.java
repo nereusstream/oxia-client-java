@@ -88,9 +88,11 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
     @Override
     public void close() {
         closed = true;
+        initialAssignmentsFuture.completeExceptionally(new IllegalStateException("Shard manager closed"));
     }
 
     public CompletableFuture<Void> start() {
+        if (closed) return CompletableFuture.failedFuture(new IllegalStateException("Shard manager closed"));
         var req = new ShardAssignmentsRequest();
         req.setNamespace(assignments.getNamespace());
 
@@ -100,6 +102,7 @@ public class ShardManager implements AutoCloseable, StreamObserver<ShardAssignme
 
     @Override
     public void onNext(ShardAssignments assignments) {
+        if (closed) return;
         shardAssignmentsEvents.increment();
         updateAssignments(assignments);
         backoff.reset();

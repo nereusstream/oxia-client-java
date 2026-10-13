@@ -31,7 +31,13 @@ public class BatchManager implements AutoCloseable {
     private volatile boolean closed;
 
     BatchManager(@NonNull ClientConfig config, String name, @NonNull BatchFactory batchFactory) {
+        this(config, name, batchFactory, ignored -> {});
+    }
+
+    private BatchManager(ClientConfig config, String name, BatchFactory batchFactory,
+            java.util.function.Consumer<BatchManager> allocated) {
         this.batchers = new Batcher[config.batchingThreads()];
+        allocated.accept(this);
         for (int i = 0; i < batchers.length; i++) {
             batchers[i] = new Batcher(config, name + "-" + i, batchFactory);
         }
@@ -46,13 +52,53 @@ public class BatchManager implements AutoCloseable {
 
     @Override
     public void close() throws Exception {
-        if (closed) {
-            return;
-        }
         closed = true;
+        Throwable first = null;
         for (Batcher batcher : batchers) {
-            batcher.close();
+            if (batcher == null) continue;
+            try { batcher.close(); }
+            catch (Throwable failure) { if (first == null) first = failure; else first.addSuppressed(failure); }
         }
+        if (first != null) throw new IllegalStateException("batch cleanup request failed", first);
+    }
+
+    public Throwable closeFailure() {
+        Throwable first = null;
+        for (Batcher batcher : batchers) {
+            if (batcher != null && batcher.closeFailure() != null) {
+                if (first == null) first = batcher.closeFailure();
+                else if (first != batcher.closeFailure()) {
+                    boolean held = false;
+                    for (Throwable prior : first.getSuppressed()) if (prior == batcher.closeFailure()) held = true;
+                    if (!held) first.addSuppressed(batcher.closeFailure());
+                }
+            }
+        }
+        return first;
+    }
+
+    public boolean isTerminated() {
+        if (!closed) return false;
+        for (Batcher batcher : batchers) if (batcher != null && !batcher.isTerminated()) return false;
+        return true;
+    }
+
+    public void awaitTermination(long nanos) throws InterruptedException {
+        long start = System.nanoTime();
+        for (Batcher batcher : batchers) {
+            long elapsed = System.nanoTime() - start;
+            if (batcher != null) batcher.awaitTermination(elapsed < 0 || elapsed >= nanos ? 0 : nanos - elapsed);
+        }
+    }
+
+    public static BatchManager newReadBatchManager(ClientConfig config, RpcProvider rpc,
+            InstrumentProvider instruments, java.util.function.Consumer<BatchManager> allocated) {
+        return new BatchManager(config, "oxia-read-batcher", new ReadBatchFactory(rpc, config, instruments), allocated);
+    }
+
+    public static BatchManager newWriteBatchManager(ClientConfig config, RpcProvider rpc, SessionManager sessions,
+            InstrumentProvider instruments, java.util.function.Consumer<BatchManager> allocated) {
+        return new BatchManager(config, "oxia-write-batcher", new WriteBatchFactory(rpc, sessions, config, instruments), allocated);
     }
 
     public static @NonNull BatchManager newReadBatchManager(

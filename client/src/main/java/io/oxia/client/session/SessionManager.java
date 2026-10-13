@@ -43,7 +43,9 @@ public class SessionManager
     private final RpcProvider rpcProvider;
 
     private final ReadWriteLock closedLock;
-    private boolean closed;
+    private volatile boolean closed;
+    private volatile CompletableFuture<Void> closing;
+    private volatile Throwable closeFailure;
 
     public SessionManager(
             @NonNull ScheduledExecutorService asyncExecutor,
@@ -64,7 +66,7 @@ public class SessionManager
         // Lock-free fast path: this runs on every ephemeral put, and compute() locks the map
         // bin even when the session already exists
         final CompletableFuture<Session> existing = sessions.get(shardId);
-        if (isUsable(existing)) {
+        if (!closed && isUsable(existing)) {
             return existing;
         }
 
@@ -110,29 +112,31 @@ public class SessionManager
     }
 
     @Override
-    public void close() throws Exception {
-        final List<CompletableFuture<Void>> futures;
+    public void close() { requestClose(); }
+
+    public void requestClose() {
         final Lock wLock = closedLock.writeLock();
+        wLock.lock();
         try {
-            wLock.lock();
-            if (closed) {
-                return;
-            }
+            if (closing != null) return;
             closed = true;
-            // do our best to close all sessions
-            futures =
-                    sessions.values().stream()
-                            .map(sf -> sf.thenCompose(Session::close).exceptionally(ex -> null))
-                            .toList();
-            sessions.clear();
-        } finally {
-            wLock.unlock();
-        }
-        allOf(futures.toArray(CompletableFuture[]::new)).join();
+            var futures = sessions.values().stream().map(sf -> sf.thenCompose(Session::close)).toList();
+            closing = allOf(futures.toArray(CompletableFuture[]::new));
+            closing.whenComplete((value, failure) -> { if (failure != null) closeFailure = failure; });
+            // Keep original futures and sessions until actual client termination; no remote-close success inference.
+        } finally { wLock.unlock(); }
     }
+
+    public void awaitClose(long nanos) throws Exception {
+        var original = closing;
+        if (original != null && nanos > 0) original.get(nanos, java.util.concurrent.TimeUnit.NANOSECONDS);
+    }
+
+    public Throwable closeFailure() { return closeFailure; }
 
     @Override
     public void accept(@NonNull ShardAssignmentChanges changes) {
+        if (closed) return;
         changes
                 .removed()
                 .forEach(

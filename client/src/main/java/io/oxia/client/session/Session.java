@@ -154,10 +154,13 @@ public class Session {
         return closed.get();
     }
 
-    public CompletableFuture<Void> close() {
+    private CompletableFuture<Void> closing;
+
+    public synchronized CompletableFuture<Void> close() {
         if (!closed.compareAndSet(false, true)) {
-            return CompletableFuture.completedFuture(null);
+            return closing;
         }
+        closing = new CompletableFuture<>();
         CompletableFuture<Void> future;
         try {
             sessionsClosed.increment();
@@ -168,13 +171,16 @@ public class Session {
         } catch (Throwable ex) {
             future = CompletableFuture.failedFuture(Throwables.getRootCause(ex));
         }
-        return future.whenComplete(
+        future.whenComplete(
                 (__, error) -> {
                     if (error != null) {
+                        closing.completeExceptionally(error);
                         log.warn().exceptionMessage(error).log("Session closed failed.");
                         return;
                     }
+                    closing.complete(null);
                     log.info("Session closed");
                 });
+        return closing;
     }
 }

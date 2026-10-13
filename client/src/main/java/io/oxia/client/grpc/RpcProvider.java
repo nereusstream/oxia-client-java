@@ -26,6 +26,10 @@ import java.util.function.LongFunction;
 import lombok.NonNull;
 
 public interface RpcProvider extends AutoCloseable {
+    /** Unknown/borrowed transport never self-reports native termination. */
+    default boolean isTerminated() { return false; }
+    default void awaitTermination(long nanos) throws InterruptedException {}
+    default Throwable closeFailure() { return null; }
     static RpcProvider create(
             @NonNull ClientConfig clientConfig,
             @NonNull ScheduledExecutorService asyncExecutor,

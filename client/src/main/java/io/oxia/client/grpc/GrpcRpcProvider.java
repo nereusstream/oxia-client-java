@@ -62,6 +62,9 @@ final class GrpcRpcProvider implements RpcProvider {
     private static final Metadata.Key<String> SHARD_ID_KEY =
             Metadata.Key.of("shard-id", Metadata.ASCII_STRING_MARSHALLER);
 
+    private volatile boolean closed;
+    private volatile Throwable closeFailure;
+    private final Object failureLock = new Object();
     private final ClientConfig clientConfig;
     private final ConnectionManager connectionManager;
     private final ScheduledExecutorService asyncExecutor;
@@ -246,7 +249,8 @@ final class GrpcRpcProvider implements RpcProvider {
     }
 
     @Override
-    public ManagedWriteStream getWriteStream(long shardId) {
+    public synchronized ManagedWriteStream getWriteStream(long shardId) {
+        if (closed) throw new IllegalStateException("RPC provider closed");
         return writeStreams.compute(
                 shardId,
                 (__, existingStream) -> {
@@ -380,12 +384,33 @@ final class GrpcRpcProvider implements RpcProvider {
     }
 
     @Override
-    public void close() throws Exception {
-        try {
-            writeStreams.values().forEach(ManagedWriteStream::close);
-            writeStreams.clear();
-        } finally {
-            connectionManager.close();
+    public void close() {
+        final java.util.List<ManagedWriteStream> original;
+        synchronized (this) {
+            closed = true;
+            original = java.util.List.copyOf(writeStreams.values());
+        }
+        for (ManagedWriteStream stream : original) {
+            try { stream.close(); } catch (Throwable failure) { retainFailure(failure); }
+            retainFailure(stream.closeFailure());
+        }
+        connectionManager.close();
+    }
+
+    @Override public boolean isTerminated() { return closed && connectionManager.isTerminated(); }
+    @Override public void awaitTermination(long nanos) throws InterruptedException { connectionManager.awaitTermination(nanos); }
+    @Override public Throwable closeFailure() {
+        retainFailure(connectionManager.closeFailure());
+        return closeFailure;
+    }
+    private void retainFailure(Throwable failure) {
+        synchronized (failureLock) {
+        if (failure == null || failure == closeFailure) return;
+        if (closeFailure == null) closeFailure = failure;
+        else {
+            for (Throwable prior : closeFailure.getSuppressed()) if (prior == failure) return;
+            closeFailure.addSuppressed(failure);
+        }
         }
     }
 

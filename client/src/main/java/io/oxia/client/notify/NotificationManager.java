@@ -114,7 +114,8 @@ public class NotificationManager implements AutoCloseable, Consumer<ShardAssignm
                         Set.copyOf(shardManager.allShards()), Collections.emptySet(), Collections.emptySet()));
     }
 
-    private void connectNotificationReceivers(@NonNull ShardAssignmentChanges changes) {
+    private synchronized void connectNotificationReceivers(@NonNull ShardAssignmentChanges changes) {
+        if (closed) return;
         changes.removed().forEach(shard -> shardReceivers.remove(shard.id()).close());
         changes
                 .added()
@@ -136,11 +137,13 @@ public class NotificationManager implements AutoCloseable, Consumer<ShardAssignm
     }
 
     @Override
-    public void close() throws Exception {
-        if (closed) {
-            return;
-        }
+    public synchronized void close() throws Exception {
         closed = true;
-        shardReceivers.values().parallelStream().forEach(ShardNotificationReceiver::close);
+        Throwable first = null;
+        for (var receiver : shardReceivers.values()) {
+            try { receiver.close(); }
+            catch (Throwable failure) { if (first == null) first = failure; else first.addSuppressed(failure); }
+        }
+        if (first != null) throw new IllegalStateException("notification cleanup request failed", first);
     }
 }

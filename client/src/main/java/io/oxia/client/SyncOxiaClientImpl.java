@@ -46,6 +46,13 @@ import lombok.SneakyThrows;
 class SyncOxiaClientImpl implements SyncOxiaClient {
     private final AsyncOxiaClient asyncClient;
 
+    OxiaClientCleanup cleanup() {
+        if (!(asyncClient instanceof AsyncOxiaClientImpl original)) {
+            throw new IllegalStateException("client has no original cleanup owner");
+        }
+        return original.cleanup();
+    }
+
     @Override
     public PutResult put(@NonNull String key, byte @NonNull [] value) {
         return put(key, value, Collections.emptySet());

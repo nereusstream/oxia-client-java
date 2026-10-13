@@ -75,41 +75,60 @@ import lombok.NonNull;
 class AsyncOxiaClientImpl implements AsyncOxiaClient {
 
     static @NonNull CompletableFuture<AsyncOxiaClient> newInstance(@NonNull ClientConfig config) {
-        final ScheduledExecutorService asyncExecutor =
-                Executors.newScheduledThreadPool(
-                        Runtime.getRuntime().availableProcessors(),
-                        new DefaultThreadFactory("oxia-client-async"));
-        var instrumentProvider = new InstrumentProvider(config.openTelemetry(), config.namespace());
-        var shardManagerRef = new AtomicReference<ShardManager>();
-        var rpcProvider =
-                RpcProvider.create(config, asyncExecutor, shardId -> shardManagerRef.get().leader(shardId));
-        var shardManager =
-                new ShardManager(asyncExecutor, rpcProvider, instrumentProvider, config.namespace());
-        shardManagerRef.set(shardManager);
-        var notificationManager =
-                new NotificationManager(asyncExecutor, rpcProvider, shardManager, instrumentProvider);
-        shardManager.addCallback(notificationManager);
-        var readBatchManager =
-                BatchManager.newReadBatchManager(config, rpcProvider, instrumentProvider);
-        var sessionManager = new SessionManager(asyncExecutor, config, rpcProvider, instrumentProvider);
-        shardManager.addCallback(sessionManager);
-        var writeBatchManager =
-                BatchManager.newWriteBatchManager(config, rpcProvider, sessionManager, instrumentProvider);
+        return newInstance(config, new OxiaClientCleanup());
+    }
 
-        var client =
-                new AsyncOxiaClientImpl(
-                        config.clientIdentifier(),
-                        asyncExecutor,
-                        instrumentProvider,
-                        rpcProvider,
-                        shardManager,
-                        notificationManager,
-                        readBatchManager,
-                        writeBatchManager,
-                        sessionManager,
-                        config.requestTimeout(),
-                        config.maxPendingBytes());
-        return shardManager.start().thenApply(v -> client);
+    static CompletableFuture<AsyncOxiaClient> newInstance(ClientConfig config, OxiaClientCleanup cleanup) {
+        final CompletableFuture<AsyncOxiaClient> exposed = new CompletableFuture<>();
+        try {
+            var factory = new DefaultThreadFactory("oxia-client-async");
+            final ScheduledExecutorService asyncExecutor = Executors.newScheduledThreadPool(
+                    Runtime.getRuntime().availableProcessors(),
+                    task -> factory.newThread(() -> io.oxia.client.util.NativeCallbackScope.run(task)));
+            cleanup.executor = asyncExecutor;
+            var instrumentProvider = new InstrumentProvider(config.openTelemetry(), config.namespace());
+            var shardManagerRef = new AtomicReference<ShardManager>();
+            var rpcProvider = RpcProvider.create(config, asyncExecutor, shardId -> shardManagerRef.get().leader(shardId));
+            cleanup.rpc = rpcProvider;
+            var shardManager = new ShardManager(asyncExecutor, rpcProvider, instrumentProvider, config.namespace());
+            cleanup.shards = shardManager;
+            shardManagerRef.set(shardManager);
+            var notificationManager = new NotificationManager(asyncExecutor, rpcProvider, shardManager, instrumentProvider);
+            cleanup.notifications = notificationManager;
+            shardManager.addCallback(notificationManager);
+            var readBatchManager = BatchManager.newReadBatchManager(config, rpcProvider, instrumentProvider,
+                    allocated -> cleanup.reads = allocated);
+            var sessionManager = new SessionManager(asyncExecutor, config, rpcProvider, instrumentProvider);
+            cleanup.sessions = sessionManager;
+            shardManager.addCallback(sessionManager);
+            var writeBatchManager = BatchManager.newWriteBatchManager(config, rpcProvider, sessionManager,
+                    instrumentProvider, allocated -> cleanup.writes = allocated);
+            var client = new AsyncOxiaClientImpl(config.clientIdentifier(), asyncExecutor, instrumentProvider,
+                    rpcProvider, shardManager, notificationManager, readBatchManager, writeBatchManager,
+                    sessionManager, config.requestTimeout(), config.maxPendingBytes());
+            client.cleanup = cleanup;
+            // Complete/cancel of the outward future never loses the original allocations or startup future.
+            var started = shardManager.start();
+            exposed.whenComplete((value, error) -> {
+                if (exposed.isCancelled()) cleanup.close(Duration.ofNanos(1));
+            });
+            started.orTimeout(config.requestTimeout().toMillis(), TimeUnit.MILLISECONDS)
+                    .whenComplete((value, failure) -> {
+                        cleanup.openingFinished = true;
+                        if (failure != null || cleanup.stopped() || !exposed.complete(client)) {
+                            Throwable cause = failure != null ? failure : new IllegalStateException("Oxia opening stopped");
+                            cleanup.retainFailure(cause);
+                            cleanup.close(Duration.ofNanos(1));
+                            exposed.completeExceptionally(new OxiaClientLifecycle.OpeningFailure(cause, cleanup));
+                        }
+                    });
+        } catch (Throwable failure) {
+            cleanup.openingFinished = true;
+            cleanup.retainFailure(failure);
+            cleanup.close(Duration.ofNanos(1));
+            exposed.completeExceptionally(new OxiaClientLifecycle.OpeningFailure(failure, cleanup));
+        }
+        return exposed;
     }
 
     private final @NonNull String clientIdentifier;
@@ -123,6 +142,7 @@ class AsyncOxiaClientImpl implements AsyncOxiaClient {
     private final long requestTimeoutMs;
     private final @NonNull PendingBytesLimiter pendingBytesLimiter;
     private volatile boolean closed;
+    private OxiaClientCleanup cleanup;
 
     private final Counter counterPutBytes;
     private final Counter counterGetBytes;
@@ -170,6 +190,15 @@ class AsyncOxiaClientImpl implements AsyncOxiaClient {
         this.sessionManager = sessionManager;
         this.scheduledExecutor = scheduledExecutor;
         this.requestTimeoutMs = requestTimeout.toMillis();
+        this.cleanup = new OxiaClientCleanup();
+        this.cleanup.executor = scheduledExecutor;
+        this.cleanup.rpc = rpcProvider;
+        this.cleanup.shards = shardManager;
+        this.cleanup.notifications = notificationManager;
+        this.cleanup.reads = readBatchManager;
+        this.cleanup.writes = writeBatchManager;
+        this.cleanup.sessions = sessionManager;
+        this.cleanup.openingFinished = true;
 
         counterPutBytes =
                 instrumentProvider.newCounter(
@@ -872,21 +901,19 @@ class AsyncOxiaClientImpl implements AsyncOxiaClient {
 
     @Override
     public void close() throws Exception {
-        if (closed) {
-            return;
-        }
         closed = true;
-        readBatchManager.close();
-        writeBatchManager.close();
-        sessionManager.close();
-        notificationManager.close();
-        shardManager.close();
-        rpcProvider.close();
-        scheduledExecutor.shutdownNow();
+        if (cleanup == null) throw new IllegalStateException("client has no registered cleanup owner");
+        var status = cleanup.close(Duration.ofMillis(Math.max(1, Math.min(60_000, requestTimeoutMs))));
+        if (!status.terminated()) {
+            throw new IllegalStateException("Oxia native cleanup remains pending", status.firstFailure());
+        }
+        if (status.firstFailure() != null) throw new IllegalStateException("Oxia cleanup retained a failure", status.firstFailure());
     }
 
+    OxiaClientCleanup cleanup() { return cleanup; }
+
     private void checkIfClosed() {
-        if (closed) {
+        if (closed || (cleanup != null && cleanup.stopped())) {
             throw new IllegalStateException("Client has been closed");
         }
     }

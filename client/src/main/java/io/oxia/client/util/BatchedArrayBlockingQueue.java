@@ -125,15 +125,23 @@ public class BatchedArrayBlockingQueue<T> extends AbstractQueue<T>
         }
     }
 
+    private boolean producerClosed;
+
+    public void closeForProducers() {
+        lock.lock();
+        try { producerClosed = true; notFull.signalAll(); }
+        finally { lock.unlock(); }
+    }
+
     @Override
     public void put(@NonNull T e) throws InterruptedException {
         lock.lockInterruptibly();
 
         try {
-            while (size == capacity) {
+            while (size == capacity && !producerClosed) {
                 notFull.await();
             }
-
+            if (producerClosed) throw new IllegalStateException("queue closed for producers");
             enqueueOne(e);
         } finally {
             lock.unlock();

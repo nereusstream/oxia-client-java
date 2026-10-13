@@ -43,6 +43,7 @@ public class Batcher implements AutoCloseable {
 
     private final Thread thread;
     private volatile boolean closed;
+    private volatile Throwable cleanupFailure;
 
     Batcher(@NonNull ClientConfig config, String name, @NonNull BatchFactory batchFactory) {
         this(config, name, batchFactory, new BatchedArrayBlockingQueue<>(DEFAULT_QUEUE_CAPACITY));
@@ -57,7 +58,7 @@ public class Batcher implements AutoCloseable {
         this.batchFactory = batchFactory;
         this.operations = operations;
 
-        this.thread = new DefaultThreadFactory(name).newThread(this::batcherLoop);
+        this.thread = new DefaultThreadFactory(name).newThread(() -> io.oxia.client.util.NativeCallbackScope.run(this::batcherLoop));
         this.thread.start();
     }
 
@@ -68,9 +69,11 @@ public class Batcher implements AutoCloseable {
         }
         try {
             operations.put(operation);
+        } catch (IllegalStateException stopped) {
+            operation.fail(stopped);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException(e);
+            operation.fail(e);
         }
     }
 
@@ -79,7 +82,8 @@ public class Batcher implements AutoCloseable {
         int localOperationsIndex = 0;
         int localOperationsCount = 0;
 
-        while (true) {
+        try {
+        while (!closed) {
             try {
                 if (localOperationsIndex >= localOperationsCount) {
                     if (batchesByShardId.isEmpty()) {
@@ -103,7 +107,6 @@ public class Batcher implements AutoCloseable {
                 }
             } catch (InterruptedException e) {
                 // Exiting thread
-                failPendingOperations();
                 return;
             }
 
@@ -135,7 +138,19 @@ public class Batcher implements AutoCloseable {
                 }
             }
         }
+        } finally {
+            var failure = new IllegalStateException("Batcher has been closed");
+            for (int i = localOperationsIndex; i < localOperationsCount; i++) {
+                if (localOperations[i] != null) {
+                    try { localOperations[i].fail(failure); }
+                    catch (Throwable error) { retainFailure(error); }
+                    localOperations[i] = null;
+                }
+            }
+            failPendingOperations();
+        }
     }
+
 
     private void sendAll() {
         batchesByShardId.values().forEach(Batch::send);
@@ -144,22 +159,34 @@ public class Batcher implements AutoCloseable {
 
     private void failPendingOperations() {
         var closedException = new IllegalStateException("Batcher has been closed");
-        batchesByShardId.values().forEach(batch -> batch.fail(closedException));
+        for (Batch batch : batchesByShardId.values()) {
+            try { batch.fail(closedException); } catch (Throwable error) { retainFailure(error); }
+        }
         batchesByShardId.clear();
         Operation<?> operation;
         while ((operation = operations.poll()) != null) {
-            operation.fail(closedException);
+            try { operation.fail(closedException); } catch (Throwable error) { retainFailure(error); }
         }
     }
 
     @Override
     public void close() {
         closed = true;
+        operations.closeForProducers();
         thread.interrupt();
-        try {
-            thread.join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+    }
+
+    private synchronized void retainFailure(Throwable failure) {
+        if (cleanupFailure == null) cleanupFailure = failure;
+        else if (cleanupFailure != failure) cleanupFailure.addSuppressed(failure);
+    }
+    public Throwable closeFailure() { return cleanupFailure; }
+
+    public boolean isTerminated() { return closed && !thread.isAlive(); }
+
+    public void awaitTermination(long nanos) throws InterruptedException {
+        if (nanos > 0 && Thread.currentThread() != thread) {
+            thread.join(nanos / 1_000_000, (int) (nanos % 1_000_000));
         }
     }
 }

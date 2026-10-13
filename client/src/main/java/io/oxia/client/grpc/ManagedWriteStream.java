@@ -46,6 +46,7 @@ public final class ManagedWriteStream implements AutoCloseable {
     private final ReentrantLock lock;
     @Getter private volatile boolean closed;
     private OxiaStatusException closedError;
+    private volatile Throwable cleanupFailure;
     private final Deque<InflightWrite> inflightWrites;
     private ManagedSubWriteStream subStreamObserver;
 
@@ -95,7 +96,8 @@ public final class ManagedWriteStream implements AutoCloseable {
                                         try {
                                             inflight.future.completeExceptionally(oxiaStatusException);
                                         } catch (Throwable ex) {
-                                            log.warn().exceptionMessage(ex).log("Failed to complete inflight write");
+                                            retainCleanupFailure(ex);
+                                log.warn().exceptionMessage(ex).log("Failed to complete inflight write");
                                         }
                                     }
                                 }
@@ -333,6 +335,12 @@ public final class ManagedWriteStream implements AutoCloseable {
         }
     }
 
+    Throwable closeFailure() { return cleanupFailure; }
+    private synchronized void retainCleanupFailure(Throwable failure) {
+        if (cleanupFailure == null) cleanupFailure = failure;
+        else if (cleanupFailure != failure) cleanupFailure.addSuppressed(failure);
+    }
+
     private List<InflightWrite> close0(OxiaStatusException error) {
         if (closed) {
             return null;
@@ -346,6 +354,7 @@ public final class ManagedWriteStream implements AutoCloseable {
             try {
                 closingObserver.complete();
             } catch (Throwable ex) {
+                retainCleanupFailure(ex);
                 log.warn().exceptionMessage(ex).log("Failed to close write stream");
             }
         }

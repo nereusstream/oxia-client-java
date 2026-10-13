@@ -39,3 +39,25 @@ Feel free to open an [issue](https://github.com/oxia-db/oxia/issues/new) or star
 Copyright 2022-2026 The Oxia Authors
 
 Licensed under the Apache License, Version 2.0: http://www.apache.org/licenses/LICENSE-2.0
+
+### Owned client cleanup for Nereus Delay
+
+The `nereus/delay-client-cleanup-v1` branch is based on `v0.9.0` and adds
+`OxiaClientLifecycle.openSync(builder)`. Its opening retains a cleanup-only
+capability before the client is exposed. Construction/startup failure and a
+cancelled or late opening keep the same capability; no half-constructed client
+is returned. The owned opening requires an actual request timeout of 1..60000ms.
+
+`cleanup.close(Duration)` stops admission and uses one observation deadline.
+`cleanup.status()` reports original batch-thread exit, owned gRPC channel/call
+termination and executor termination, independently of the first retained
+failure. Run cleanup on the application's existing bounded I/O executor; retain
+that original task if a callback blocks, and observe it to exit before another
+attempt. Native callbacks never wait for themselves. Pending shutdowns retain
+original objects; unhealthy/replaced and partially constructed channels remain
+owned until termination. Global Netty/OpenTelemetry facilities are not closed.
+
+Native termination is not evidence of a remote Put/Delete/CAS outcome, ephemeral
+marker deletion, Owner release or checkpoint completion. Those obligations stay
+with the application. This branch has development compilation evidence only;
+fault, Broker and recovery validation is deferred with NDIP-3.

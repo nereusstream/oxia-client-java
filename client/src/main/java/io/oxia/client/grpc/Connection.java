@@ -54,6 +54,7 @@ class Connection implements AutoCloseable, StreamObserver<HealthCheckResponse> {
     private final @NonNull OxiaClientGrpc.OxiaClientStub asyncStub;
     private final @NonNull HealthGrpc.HealthStub healthStub;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicInteger activeCalls = new java.util.concurrent.atomic.AtomicInteger();
     private final AtomicBoolean healthCheckInProgress = new AtomicBoolean();
     private final @Nullable ScheduledFuture<?> healthCheckTask;
     private final @Nullable HealthCheckFailureCallback healthCheckFailureCallback;
@@ -73,6 +74,7 @@ class Connection implements AutoCloseable, StreamObserver<HealthCheckResponse> {
                         .disableRetry()
                         .directExecutor()
                         .build();
+        try {
         CallCredentials credentials = null;
         var authentication = clientConfig.authentication();
         if (authentication != null) {
@@ -92,11 +94,11 @@ class Connection implements AutoCloseable, StreamObserver<HealthCheckResponse> {
                         }
                     };
         }
-        var baseHealthStub = HealthGrpc.newStub(channel);
+        var baseHealthStub = HealthGrpc.newStub(channel).withInterceptors(nativeCallbacks());
         this.healthStub =
                 credentials != null ? baseHealthStub.withCallCredentials(credentials) : baseHealthStub;
         var asyncStub =
-                OxiaClientGrpc.newStub(channel)
+                OxiaClientGrpc.newStub(channel).withInterceptors(nativeCallbacks())
                         .withMaxInboundMessageSize(MAXIMUM_FRAME_SIZE)
                         .withMaxOutboundMessageSize(MAXIMUM_FRAME_SIZE);
         this.asyncStub = credentials != null ? asyncStub.withCallCredentials(credentials) : asyncStub;
@@ -122,6 +124,56 @@ class Connection implements AutoCloseable, StreamObserver<HealthCheckResponse> {
                         clientConfig.connectionKeepAliveTime().toMillis(),
                         clientConfig.connectionKeepAliveTime().toMillis(),
                         TimeUnit.MILLISECONDS);
+        } catch (Throwable failure) {
+            throw new AllocationFailure(failure, channel);
+        }
+    }
+
+    static final class AllocationFailure extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+        final transient ManagedChannel channel;
+        AllocationFailure(Throwable failure, ManagedChannel channel) {
+            super("connection construction failed after transport allocation", failure);
+            this.channel = channel;
+        }
+    }
+
+    private io.grpc.ClientInterceptor nativeCallbacks() {
+        return new io.grpc.ClientInterceptor() {
+            @Override public <ReqT, RespT> io.grpc.ClientCall<ReqT, RespT> interceptCall(
+                    io.grpc.MethodDescriptor<ReqT, RespT> method, io.grpc.CallOptions options, io.grpc.Channel next) {
+                return new io.grpc.ForwardingClientCall.SimpleForwardingClientCall<>(next.newCall(method, options)) {
+                    @Override public void start(Listener<RespT> listener, Metadata headers) {
+                        synchronized (Connection.this) {
+                        if (closed.get()) throw new IllegalStateException("connection closed");
+                        activeCalls.incrementAndGet();
+                        var ended = new AtomicBoolean();
+                        Runnable end = () -> { if (ended.compareAndSet(false, true)) activeCalls.decrementAndGet(); };
+                        try {
+                        super.start(new io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener<>(listener) {
+                            @Override public void onHeaders(Metadata value) {
+                                io.oxia.client.util.NativeCallbackScope.run(() -> super.onHeaders(value));
+                            }
+                            @Override public void onMessage(RespT value) {
+                                io.oxia.client.util.NativeCallbackScope.run(() -> super.onMessage(value));
+                            }
+                            @Override public void onClose(Status status, Metadata trailers) {
+                                try { io.oxia.client.util.NativeCallbackScope.run(() -> super.onClose(status, trailers)); }
+                                finally { end.run(); }
+                            }
+                            @Override public void onReady() {
+                                io.oxia.client.util.NativeCallbackScope.run(super::onReady);
+                            }
+                        }, headers);
+                        } catch (Throwable failure) {
+                            end.run();
+                            throw failure;
+                        }
+                        }
+                    }
+                };
+            }
+        };
     }
 
     @NonNull
@@ -143,23 +195,16 @@ class Connection implements AutoCloseable, StreamObserver<HealthCheckResponse> {
     }
 
     @Override
-    public void close() throws Exception {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        if (healthCheckTask != null) {
-            healthCheckTask.cancel(false);
-        }
-        channel.shutdown();
-        try {
-            if (!channel.awaitTermination(100, MILLISECONDS)) {
-                channel.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            channel.shutdownNow();
-            log.warn("Interrupted while closing GRPC channel");
-            Thread.currentThread().interrupt();
-        }
+    public synchronized void close() throws Exception {
+        closed.set(true);
+        if (healthCheckTask != null) healthCheckTask.cancel(false);
+        channel.shutdownNow();
+    }
+
+    boolean isTerminated() { return closed.get() && channel.isTerminated() && activeCalls.get() == 0; }
+
+    void awaitTermination(long nanos) throws InterruptedException {
+        if (nanos > 0) channel.awaitTermination(nanos, TimeUnit.NANOSECONDS);
     }
 
     @Override
